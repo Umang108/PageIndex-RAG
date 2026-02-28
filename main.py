@@ -36,9 +36,27 @@ llm = AzureChatOpenAI(
 
 parser = StrOutputParser()
 
+# DOC CACHE SUPPORT
+DOC_CACHE_FILE = "doc_cache.json"
+
+def load_cached_doc_id():
+    if os.path.exists(DOC_CACHE_FILE):
+        try:
+            with open(DOC_CACHE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("doc_id")
+        except Exception:
+            pass
+    return None
+
+def save_doc_id(doc_id):
+    try:
+        with open(DOC_CACHE_FILE, "w") as f:
+            json.dump({"doc_id": doc_id}, f, indent=2)
+    except Exception as e:
+        print("Failed to save cache:", e)
 
 # Prompts
-
 
 tree_search_prompt = ChatPromptTemplate.from_template("""
 You are given a question and a tree structure of a document.
@@ -74,46 +92,68 @@ answer_chain = answer_prompt | llm | parser
 
 
 print("#####################################")
-print("tree_search_chain: ",tree_search_chain)
+print("tree_search_chain: ", tree_search_chain)
 print("#####################################")
-print("answer_chain: ",answer_chain)
+print("answer_chain: ", answer_chain)
 print("#####################################")
-
-
 
 # Async Main Flow
-
-
 async def main():
-    # Download PDF
 
-    pdf_path = r"D:\TCS_Work\pageindex_rag\fine tunig.pdf"
+    pdf_path = r"D:\TCS_Work\pageindex_rag\data\2501.12948.pdf"
 
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found at {pdf_path}")
 
     print("Using local PDF:", pdf_path)
+
+    # CACHE + SUBMISSION LOGIC
+
+    cached_doc_id = load_cached_doc_id()
+
     print("Submitting to PageIndex...")
-    submit_resp = pi_client.submit_document(pdf_path)
-    print("#####################################")
-    print("submit res", submit_resp)
+
+    if cached_doc_id:
+        print("Skipping submission — using cached index:", cached_doc_id)
+
+        class FakeResponse(dict):
+            def get(self, key, default=None):
+                if key == "doc_id":
+                    return cached_doc_id
+                return cached_doc_id
+
+        submit_resp = FakeResponse()
+
+    else:
+        print("No cache found — indexing document")
+
+        submit_resp = pi_client.submit_document(pdf_path)
+
+        print("#####################################")
+        print("submit res", submit_resp)
+
+        new_doc_id = submit_resp.get("doc_id") or submit_resp
+        save_doc_id(new_doc_id)
+        print("Saved doc_id to cache:", new_doc_id)
+
     doc_id = submit_resp.get("doc_id") or submit_resp
 
+    # WAIT FOR TREE
     print("Waiting for tree generation...")
     for _ in range(60):
         if pi_client.is_retrieval_ready(doc_id):
-            print("pi client: ",pi_client)
+            print("pi client:", pi_client)
             break
-            
         time.sleep(5)
     else:
         raise RuntimeError("Tree generation timeout")
-
-    # Fetch Tree
+    
+    # FETCH TREE
     tree_resp = pi_client.get_tree(doc_id, node_summary=True)
-    print("tree response: ", tree_resp)
+    print("tree response:", tree_resp)
+
     tree = tree_resp.get("result", tree_resp)
-    print("tree: ", tree)
+    print("tree:", tree)
 
     node_map = utils.create_node_mapping(tree)
 
@@ -123,9 +163,7 @@ async def main():
     )
 
     query = "What are the conclusions in this document?"
-
-    # Step 2: Reasoning Search
-
+    # Reasoning Search
     print("LLM reasoning over tree...")
 
     tree_json = json.dumps(tree_without_text, indent=2)
@@ -138,7 +176,8 @@ async def main():
     result = json.loads(result_text)
 
     print("Selected nodes:", result["node_list"])
-    # Step 3: Retrieve Nodes
+
+    # Retrieve Nodes
 
     retrieved_texts = []
 
@@ -157,8 +196,7 @@ async def main():
 
     combined_context = "\n\n".join(retrieved_texts)
 
-
-    # Step 4: Final Answer
+    # Final Answer
 
     final_answer = await answer_chain.ainvoke({
         "query": query,
